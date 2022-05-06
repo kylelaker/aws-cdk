@@ -5,7 +5,7 @@ import * as cxapi from '@aws-cdk/cx-api';
 import { IConstruct, Construct } from 'constructs';
 import { Alias } from './alias';
 import { KeyLookupOptions } from './key-lookup';
-import { CfnKey } from './kms.generated';
+import { CfnKey, CfnReplicaKey } from './kms.generated';
 import * as perms from './private/perms';
 
 /**
@@ -328,10 +328,7 @@ export enum KeyUsage {
   SIGN_VERIFY = 'SIGN_VERIFY',
 }
 
-/**
- * Construction properties for a KMS Key object
- */
-export interface KeyProps {
+interface KeyBaseOptions {
   /**
    * A description of the key. Use a description that helps your users decide
    * whether the key is appropriate for a particular task.
@@ -350,38 +347,11 @@ export interface KeyProps {
   readonly alias?: string;
 
   /**
-   * Indicates whether AWS KMS rotates the key.
-   *
-   * @default false
-   */
-  readonly enableKeyRotation?: boolean;
-
-  /**
    * Indicates whether the key is available for use.
    *
    * @default - Key is enabled.
    */
   readonly enabled?: boolean;
-
-  /**
-   * The cryptographic configuration of the key. The valid value depends on usage of the key.
-   *
-   * IMPORTANT: If you change this property of an existing key, the existing key is scheduled for deletion
-   * and a new key is created with the specified value.
-   *
-   * @default KeySpec.SYMMETRIC_DEFAULT
-   */
-  readonly keySpec?: KeySpec;
-
-  /**
-   * The cryptographic operations for which the key can be used.
-   *
-   * IMPORTANT: If you change this property of an existing key, the existing key is scheduled for deletion
-   * and a new key is created with the specified value.
-   *
-   * @default KeyUsage.ENCRYPT_DECRYPT
-   */
-  readonly keyUsage?: KeyUsage;
 
   /**
    * Custom policy document to attach to the KMS key.
@@ -447,14 +417,65 @@ export interface KeyProps {
    * @default - 30 days
    */
   readonly pendingWindow?: Duration;
+
 }
 
 /**
- * Defines a KMS key.
- *
- * @resource AWS::KMS::Key
+ * Construction properties for a KMS Key object
  */
-export class Key extends KeyBase {
+export interface KeyProps extends KeyBaseOptions {
+  /**
+   * Indicates whether AWS KMS rotates the key.
+   *
+   * @default false
+   */
+  readonly enableKeyRotation?: boolean;
+
+  /**
+   * The cryptographic configuration of the key. The valid value depends on usage of the key.
+   *
+   * IMPORTANT: If you change this property of an existing key, the existing key is scheduled for deletion
+   * and a new key is created with the specified value.
+   *
+   * @default KeySpec.SYMMETRIC_DEFAULT
+   */
+  readonly keySpec?: KeySpec;
+
+  /**
+   * The cryptographic operations for which the key can be used.
+   *
+   * IMPORTANT: If you change this property of an existing key, the existing key is scheduled for deletion
+   * and a new key is created with the specified value.
+   *
+   * @default KeyUsage.ENCRYPT_DECRYPT
+   */
+  readonly keyUsage?: KeyUsage;
+
+  /**
+   * Indicates whether the created KMS key should be a multi-region primary key.
+   *
+   * IMPORTANT: If you change this property of an existing key, the existing key is scheduled for deletion
+   * and a new key is created with the specified value.
+   *
+   * @default The key is a single-region key
+   */
+  readonly isMultiRegion?: boolean;
+}
+
+/**
+ * Construction properties for a KMS replica key object
+ */
+export interface ReplicaKeyProps extends KeyBaseOptions {
+  /**
+   * The ARN of the multi-region primary key that exists in another region.
+   *
+   * The key must be specified as a multi-region primary key and must be in a different AWS region
+   * within the same AWS partition.
+   */
+  readonly primaryKey: string;
+}
+
+abstract class InternalKeyBase extends KeyBase {
   /**
    * Import an externally defined KMS Key using its ARN.
    *
@@ -485,55 +506,6 @@ export class Key extends KeyBase {
     }
 
     return new Import(keyResourceName);
-  }
-
-  /**
-   * Create a mutable {@link IKey} based on a low-level {@link CfnKey}.
-   * This is most useful when combined with the cloudformation-include module.
-   * This method is different than {@link fromKeyArn()} because the {@link IKey}
-   * returned from this method is mutable;
-   * meaning, calling any mutating methods on it,
-   * like {@link IKey.addToResourcePolicy()},
-   * will actually be reflected in the resulting template,
-   * as opposed to the object returned from {@link fromKeyArn()},
-   * on which calling those methods would have no effect.
-   */
-  public static fromCfnKey(cfnKey: CfnKey): IKey {
-    // use a "weird" id that has a higher chance of being unique
-    const id = '@FromCfnKey';
-
-    // if fromCfnKey() was already called on this cfnKey,
-    // return the same L2
-    // (as different L2s would conflict, because of the mutation of the keyPolicy property of the L1 below)
-    const existing = cfnKey.node.tryFindChild(id);
-    if (existing) {
-      return <IKey>existing;
-    }
-
-    let keyPolicy: iam.PolicyDocument;
-    try {
-      keyPolicy = iam.PolicyDocument.fromJson(cfnKey.keyPolicy);
-    } catch (e) {
-      // If the KeyPolicy contains any CloudFormation functions,
-      // PolicyDocument.fromJson() throws an exception.
-      // In that case, because we would have to effectively make the returned IKey immutable,
-      // throw an exception suggesting to use the other importing methods instead.
-      // We might make this parsing logic smarter later,
-      // but let's start by erroring out.
-      throw new Error('Could not parse the PolicyDocument of the passed AWS::KMS::Key resource because it contains CloudFormation functions. ' +
-        'This makes it impossible to create a mutable IKey from that Policy. ' +
-        'You have to use fromKeyArn instead, passing it the ARN attribute property of the low-level CfnKey');
-    }
-
-    // change the key policy of the L1, so that all changes done in the L2 are reflected in the resulting template
-    cfnKey.keyPolicy = Lazy.any({ produce: () => keyPolicy.toJSON() });
-
-    return new class extends KeyBase {
-      public readonly keyArn = cfnKey.attrArn;
-      public readonly keyId = cfnKey.ref;
-      protected readonly policy = keyPolicy;
-      protected readonly trustAccountIdentities = false;
-    }(cfnKey, id);
   }
 
   /**
@@ -590,34 +562,12 @@ export class Key extends KeyBase {
       Arn.format({ resource: 'key', service: 'kms', resourceName: attributes.keyId }, Stack.of(scope)));
   }
 
-  public readonly keyArn: string;
-  public readonly keyId: string;
   protected readonly policy?: iam.PolicyDocument;
   protected readonly trustAccountIdentities: boolean;
+  protected readonly pendingWindowInDays?: number;
 
-  constructor(scope: Construct, id: string, props: KeyProps = {}) {
+  constructor(scope: Construct, id: string, props: KeyBaseOptions = {}) {
     super(scope, id);
-
-    const denyLists = {
-      [KeyUsage.ENCRYPT_DECRYPT]: [
-        KeySpec.ECC_NIST_P256,
-        KeySpec.ECC_NIST_P384,
-        KeySpec.ECC_NIST_P521,
-        KeySpec.ECC_SECG_P256K1,
-      ],
-      [KeyUsage.SIGN_VERIFY]: [
-        KeySpec.SYMMETRIC_DEFAULT,
-      ],
-    };
-    const keySpec = props.keySpec ?? KeySpec.SYMMETRIC_DEFAULT;
-    const keyUsage = props.keyUsage ?? KeyUsage.ENCRYPT_DECRYPT;
-    if (denyLists[keyUsage].includes(keySpec)) {
-      throw new Error(`key spec '${keySpec}' is not valid with usage '${keyUsage}'`);
-    }
-
-    if (keySpec !== KeySpec.SYMMETRIC_DEFAULT && props.enableKeyRotation) {
-      throw new Error('key rotation cannot be enabled on asymmetric keys');
-    }
 
     const defaultKeyPoliciesFeatureEnabled = FeatureFlags.of(this).isEnabled(cxapi.KMS_DEFAULT_KEY_POLICIES);
 
@@ -648,26 +598,7 @@ export class Key extends KeyBase {
         throw new Error(`'pendingWindow' value must between 7 and 30 days. Received: ${pendingWindowInDays}`);
       }
     }
-
-    const resource = new CfnKey(this, 'Resource', {
-      description: props.description,
-      enableKeyRotation: props.enableKeyRotation,
-      enabled: props.enabled,
-      keySpec: props.keySpec,
-      keyUsage: props.keyUsage,
-      keyPolicy: this.policy,
-      pendingWindowInDays: pendingWindowInDays,
-    });
-
-    this.keyArn = resource.attrArn;
-    this.keyId = resource.ref;
-    resource.applyRemovalPolicy(props.removalPolicy);
-
-    (props.admins ?? []).forEach((p) => this.grantAdmin(p));
-
-    if (props.alias !== undefined) {
-      this.addAlias(props.alias);
-    }
+    this.pendingWindowInDays = pendingWindowInDays;
   }
 
   /**
@@ -729,6 +660,153 @@ export class Key extends KeyBase {
       actions,
       principals: [new iam.AccountRootPrincipal()],
     }));
+  }
+
+}
+
+/**
+ * Defines a KMS key.
+ *
+ * @resource AWS::KMS::Key
+ */
+export class Key extends InternalKeyBase {
+  /**
+   * Create a mutable {@link IKey} based on a low-level {@link CfnKey}.
+   * This is most useful when combined with the cloudformation-include module.
+   * This method is different than {@link fromKeyArn()} because the {@link IKey}
+   * returned from this method is mutable;
+   * meaning, calling any mutating methods on it,
+   * like {@link IKey.addToResourcePolicy()},
+   * will actually be reflected in the resulting template,
+   * as opposed to the object returned from {@link fromKeyArn()},
+   * on which calling those methods would have no effect.
+   */
+  public static fromCfnKey(cfnKey: CfnKey): IKey {
+    // use a "weird" id that has a higher chance of being unique
+    const id = '@FromCfnKey';
+
+    // if fromCfnKey() was already called on this cfnKey,
+    // return the same L2
+    // (as different L2s would conflict, because of the mutation of the keyPolicy property of the L1 below)
+    const existing = cfnKey.node.tryFindChild(id);
+    if (existing) {
+      return <IKey>existing;
+    }
+
+    let keyPolicy: iam.PolicyDocument;
+    try {
+      keyPolicy = iam.PolicyDocument.fromJson(cfnKey.keyPolicy);
+    } catch (e) {
+      // If the KeyPolicy contains any CloudFormation functions,
+      // PolicyDocument.fromJson() throws an exception.
+      // In that case, because we would have to effectively make the returned IKey immutable,
+      // throw an exception suggesting to use the other importing methods instead.
+      // We might make this parsing logic smarter later,
+      // but let's start by erroring out.
+      throw new Error('Could not parse the PolicyDocument of the passed AWS::KMS::Key resource because it contains CloudFormation functions. ' +
+        'This makes it impossible to create a mutable IKey from that Policy. ' +
+        'You have to use fromKeyArn instead, passing it the ARN attribute property of the low-level CfnKey');
+    }
+
+    // change the key policy of the L1, so that all changes done in the L2 are reflected in the resulting template
+    cfnKey.keyPolicy = Lazy.any({ produce: () => keyPolicy.toJSON() });
+
+    return new class extends KeyBase {
+      public readonly keyArn = cfnKey.attrArn;
+      public readonly keyId = cfnKey.ref;
+      protected readonly policy = keyPolicy;
+      protected readonly trustAccountIdentities = false;
+    }(cfnKey, id);
+  }
+
+  public readonly keyArn: string;
+  public readonly keyId: string;
+  protected readonly policy?: iam.PolicyDocument;
+
+  constructor(scope: Construct, id: string, props: KeyProps = {}) {
+    super(scope, id);
+
+    const denyLists = {
+      [KeyUsage.ENCRYPT_DECRYPT]: [
+        KeySpec.ECC_NIST_P256,
+        KeySpec.ECC_NIST_P384,
+        KeySpec.ECC_NIST_P521,
+        KeySpec.ECC_SECG_P256K1,
+      ],
+      [KeyUsage.SIGN_VERIFY]: [
+        KeySpec.SYMMETRIC_DEFAULT,
+      ],
+    };
+    const keySpec = props.keySpec ?? KeySpec.SYMMETRIC_DEFAULT;
+    const keyUsage = props.keyUsage ?? KeyUsage.ENCRYPT_DECRYPT;
+    if (denyLists[keyUsage].includes(keySpec)) {
+      throw new Error(`key spec '${keySpec}' is not valid with usage '${keyUsage}'`);
+    }
+
+    if (keySpec !== KeySpec.SYMMETRIC_DEFAULT && props.enableKeyRotation) {
+      throw new Error('key rotation cannot be enabled on asymmetric keys');
+    }
+
+    const resource = new CfnKey(this, 'Resource', {
+      description: props.description,
+      enableKeyRotation: props.enableKeyRotation,
+      enabled: props.enabled,
+      keySpec: props.keySpec,
+      keyUsage: props.keyUsage,
+      keyPolicy: this.policy,
+      pendingWindowInDays: super.pendingWindowInDays,
+      multiRegion: props.isMultiRegion,
+    });
+
+    this.keyArn = resource.attrArn;
+    this.keyId = resource.ref;
+    resource.applyRemovalPolicy(props.removalPolicy);
+
+    (props.admins ?? []).forEach((p) => this.grantAdmin(p));
+
+    if (props.alias !== undefined) {
+      this.addAlias(props.alias);
+    }
+  }
+}
+
+/**
+ * Defines a KMS multi-Region Replica Key based on a multi-Region primary key.
+ *
+ * This allows creating a KMS Replica in the current region for a multi-region primary
+ * in another region (within the same partition).
+ *
+ * @resource AWS::KMS::ReplicaKey
+ */
+export class ReplicaKey extends InternalKeyBase {
+  public readonly keyArn: string;
+  public readonly keyId: string;
+  protected readonly policy?: iam.PolicyDocument | undefined;
+
+  constructor(scope: Construct, id: string, props: ReplicaKeyProps) {
+    super(scope, id);
+    const primaryKeyArn = Arn.split(props.primaryKey, ArnFormat.SLASH_RESOURCE_NAME);
+    if (!primaryKeyArn.resourceName?.startsWith('mrk')) {
+      throw new Error(`Primary Key ARN must be a multi-region key. Got ${primaryKeyArn}`);
+    }
+
+    const resource = new CfnReplicaKey(this, 'Resource', {
+      primaryKeyArn: props.primaryKey,
+      description: props.description,
+      enabled: props.enabled,
+      keyPolicy: this.policy,
+      pendingWindowInDays: this.pendingWindowInDays,
+    });
+
+    this.keyArn = resource.attrArn;
+    this.keyId = resource.ref;
+    resource.applyRemovalPolicy(props.removalPolicy);
+
+    (props.admins ?? []).forEach((p) => this.grantAdmin(p));
+
+    if (props.alias !== undefined) {
+      this.addAlias(props.alias);
+    }
   }
 }
 

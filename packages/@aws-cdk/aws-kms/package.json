@@ -107,7 +107,13 @@
   },
   "awslint": {
     "exclude": [
-      "props-physical-name:@aws-cdk/aws-kms.KeyProps"
+      "props-physical-name:@aws-cdk/aws-kms.KeyProps",
+      "props-physical-name:@aws-cdk/aws-kms.ReplicaKeyProps",
+      "resource-attribute:@aws-cdk/aws-kms.ReplicaKey.replicaKeyArn",
+      "duration-prop-name:@aws-cdk/aws-kms.Key.pendingWindowInDays",
+      "duration-prop-type:@aws-cdk/aws-kms.Key.pendingWindowInDays",
+      "duration-prop-name:@aws-cdk/aws-kms.ReplicaKey.pendingWindowInDays",
+      "duration-prop-type:@aws-cdk/aws-kms.ReplicaKey.pendingWindowInDays"
     ]
   },
   "stability": "stable",
